@@ -4,6 +4,7 @@ import torch.nn.functional as F
 
 from transformers import AutoTokenizer, AutoModel
 
+import pdb
 
 def add_gumbel_noise(logits, temperature):
     '''
@@ -116,7 +117,7 @@ import os
 DEBUG_PRINT_OUTPUT = os.environ.get('DEBUG_PRINT_OUTPUT',False)
 @ torch.no_grad()
 def generate(model, prompt=None, steps=None, max_new_tokens=128, block_length=128, temperature=0.,
-             cfg_scale=0., remasking='low_confidence', mask_id=126336,inputs_embeds=None, position_ids=None,attention_mask=None,
+              cfg_scale=0., remasking='low_confidence', mask_id=126336,inputs_embeds=None, position_ids=None,attention_mask=None,
               tokenizer=None,
                 verbose=False,
                 step_per_block=None,
@@ -143,6 +144,13 @@ def generate(model, prompt=None, steps=None, max_new_tokens=128, block_length=12
     # step_ratio = 0.5
     # block_length = 1024
     # steps = 1024
+
+    if hasattr(model, 'transformer') and hasattr(model.transformer, 'blocks'):
+        # print("正在重置所有 LLaDABlock 的状态...")
+        for block in model.transformer.blocks:
+            if hasattr(block, 'reset_request_state'):
+                block.reset_request_state()
+    
     steps = max_new_tokens # min(steps,max_new_tokens)
     # if step_ratio:
     #     steps = int(max_new_tokens*step_ratio)
@@ -154,6 +162,7 @@ def generate(model, prompt=None, steps=None, max_new_tokens=128, block_length=12
         prompt = torch.full((bsz, seq_len), 0, dtype=torch.long).to(model.device)
     past_key_values = None
     if prefix_lm:
+        # model 是 llava llada model
         past_key_values = model(None,input_embeddings=inputs_embeds,use_cache=True).attn_key_values
         # breakpoint()
         x = torch.full((bsz, gen_length), mask_id, dtype=torch.long).to(model.device)
@@ -191,14 +200,12 @@ def generate(model, prompt=None, steps=None, max_new_tokens=128, block_length=12
     if verbose:
         history = []
     for num_block in range(num_blocks):
-
         block_mask_index = (x[:, prompt.shape[1] + num_block * block_length: prompt.shape[1] + (num_block + 1) * block_length:] == mask_id)
         num_transfer_tokens = get_num_transfer_tokens_sch(block_mask_index, steps,schedule=schedule,schedule_kwargs=schedule_kwargs)
         if DEBUG_PRINT_OUTPUT:
             print(f"Block: {num_block + 1}/{num_blocks}, Steps per Block: {steps}, Block Length: {block_length}")
             print(f"Tokens generated per step {num_transfer_tokens[0]}")
         for i in range(steps):
-            # print(i)
             mask_index = (x == mask_id)
             block_mask_index = mask_index[:, prompt.shape[1] + num_block * block_length: prompt.shape[1] + (num_block + 1) * block_length:]
             # print(mask_index.sum())
@@ -219,13 +226,18 @@ def generate(model, prompt=None, steps=None, max_new_tokens=128, block_length=12
                 #print(tokenizer.batch_decode(x)[0].replace('<|endoftext|>',''))
                 # print((x==mask_id).sum())
                 # breakpoint()
+                
+                # print(f"--- [generate.py] 进入循环, i = {i}。准备调用模型...")
+                
                 if prefix_lm:
                     # breakpoint()
-                    logits = model(None,input_embeddings=inputs_embeds_curr,past_key_values=past_key_values).logits
+                    logits = model(None,input_embeddings=inputs_embeds_curr,past_key_values=past_key_values,decode_step=i).logits
                 else:
                     if inputs_embeds is not None:
                         inputs_embeds_curr[:,:inputs_embeds.shape[1]] = inputs_embeds
-                    logits = model(None,input_embeddings=inputs_embeds_curr).logits
+
+                    logits = model(None,input_embeddings=inputs_embeds_curr,decode_step=i).logits
+                
             # logits = logits.cpu()
             logits_with_noise = add_gumbel_noise(logits, temperature=temperature)
             x0 = torch.argmax(logits_with_noise, dim=-1) # b, l
@@ -272,7 +284,6 @@ def generate(model, prompt=None, steps=None, max_new_tokens=128, block_length=12
     if verbose:
         return x,history
     return x
-
 
 def main():
     device = 'cuda'
