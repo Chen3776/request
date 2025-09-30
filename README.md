@@ -1,6 +1,6 @@
 ## DLLM推理加速
 
-最终目标是实现一种快速attention算法，在多个DLLM上拿到推理加速。先在LaViDa-L模型上试通。
+目标是实现快速attention算法，在多个DLLM上拿到推理加速。先在LaViDa-L模型上试通。
 
 ## 这套代码用法
 
@@ -16,4 +16,11 @@ bash eval/others_L_2.sh
 ```bash
 cd LaViDa-main
 python plot_semi.py
+```
+
+测速：最简单的测速脚本，是调用自定义attention函数并计时。
+
+```bash
+cd LaViDa-main
+python time3.py
 ```
