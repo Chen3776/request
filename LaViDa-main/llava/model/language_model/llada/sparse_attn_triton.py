@@ -135,7 +135,7 @@ def sparse_attention_triton(q, k, v, topk_indices, hs, dropout_p=0.0, training=F
 
     # 配置并行维度
     grid = (B, nH, T_q)
-    BLOCK_D = 64  # 每个程序处理 64 维（可调）
+    BLOCK_D = hs  # 每个程序处理 64 维（可调）
     BLOCK_K = 32  # 每次处理 32 个 Top-K 索引（可调）
 
     # 启动 Triton kernel

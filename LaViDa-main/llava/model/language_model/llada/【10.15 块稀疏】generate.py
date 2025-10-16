@@ -221,11 +221,11 @@ def generate(model, prompt=None, steps=None, max_new_tokens=128, block_length=12
                 # breakpoint()
                 if prefix_lm:
                     # breakpoint()
-                    logits = model(None,input_embeddings=inputs_embeds_curr,past_key_values=past_key_values).logits
+                    logits = model(None,input_embeddings=inputs_embeds_curr,past_key_values=past_key_values,decode_step = i,block_length=block_length,gen_length=gen_length).logits
                 else:
                     if inputs_embeds is not None:
                         inputs_embeds_curr[:,:inputs_embeds.shape[1]] = inputs_embeds
-                    logits = model(None,input_embeddings=inputs_embeds_curr).logits
+                    logits = model(None,input_embeddings=inputs_embeds_curr,decode_step = i,block_length=block_length,gen_length=gen_length).logits
             # logits = logits.cpu()
             logits_with_noise = add_gumbel_noise(logits, temperature=temperature)
             x0 = torch.argmax(logits_with_noise, dim=-1) # b, l
@@ -256,7 +256,6 @@ def generate(model, prompt=None, steps=None, max_new_tokens=128, block_length=12
 
             x0 = torch.where(mask_index, x0, x)
             confidence = torch.where(mask_index, x0_p, -np.inf)
-            print(confidence[mask_index])
 
             transfer_index = torch.zeros_like(x0, dtype=torch.bool, device=x0.device)
             for j in range(confidence.shape[0]):

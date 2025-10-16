@@ -641,11 +641,13 @@ class LLaDABlock(nn.Module):
         attn_mask: Optional[torch.Tensor] = None,
         dropout_p: float = 0.0,
         is_causal: bool = False,
+        decode_step=decode_step,
     ) -> torch.Tensor:
         """
         Computes scaled dot product attention on query, key and value tensors, using an optional
         attention mask if passed, and applying dropout if a probability greater than 0.0 is specified.
         """
+
         if self.flash_attn_func is not None and attn_mask is None:
             r = self.flash_attn_func(
                 q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), dropout_p=dropout_p, causal=False
@@ -706,6 +708,7 @@ class LLaDABlock(nn.Module):
         layer_past: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         use_cache: bool = False,
         block_mask: bool = None,
+        decode_step = None
     ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         B, T, C = q.size()  # batch size, sequence length, d_model
         dtype = k.dtype
@@ -766,6 +769,7 @@ class LLaDABlock(nn.Module):
                 attn_mask=None,
                 dropout_p=0.0 if not self.training else self.config.attention_dropout,
                 is_causal=False,
+                decode_step=decode_step,
             )
 
         # Re-assemble all head outputs side-by-side.
@@ -942,6 +946,7 @@ class LLaDALlamaBlock(LLaDABlock):
         layer_past: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         use_cache: bool = False,
         block_mask = None,
+        decode_step = None,
     ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         # Get query, key, value projections.
         # shape:
@@ -1223,6 +1228,7 @@ class LLaDAModel(nn.Module):
         last_logits_only: bool = False,
         output_hidden_states: Optional[bool] = None,
         prefix_length=None,
+        decode_step=None,
     ) -> LLaDAOutput:
         """
         :param input_ids: A tensor of shape `(batch_size, seq_len)`.
@@ -1386,7 +1392,7 @@ class LLaDAModel(nn.Module):
                     )
                 else:
                     # shape: (batch_size, seq_len, d_model)
-                    x, cache = block(x, attention_bias=attention_bias, layer_past=layer_past, use_cache=use_cache,block_mask=block_mask)
+                    x, cache = block(x, attention_bias=attention_bias, layer_past=layer_past, use_cache=use_cache,block_mask=block_mask, decode_step=decode_step)
                 if attn_key_values is not None:
                     assert cache is not None
                     attn_key_values.append(cache)
@@ -1483,6 +1489,7 @@ class LLaDAModelLM(PreTrainedModel):
         position_ids: bool = None,
         prompt_len: Optional[torch.Tensor] = None,
         num_items_in_batch=None,
+        decode_step=None
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         if use_cache is None:
             use_cache = self.config.use_cache
@@ -1502,6 +1509,7 @@ class LLaDAModelLM(PreTrainedModel):
             use_cache=use_cache,
             output_hidden_states=output_hidden_states,
             prefix_length=prompt_len,
+            decode_step=decode_step,
         )
 
         logits = outputs.logits

@@ -21,6 +21,7 @@ from typing import (
 from dataclasses import fields
 from typing import List, Optional, Tuple, Union
 
+import os
 import torch
 import torch.backends.cuda
 import torch.nn as nn
@@ -75,11 +76,64 @@ __all__ = [
     "LLaDAModel",
     "LLaDAOutput",
     "LLaDAGenerateOutput",
+    "reset_internal_step_counter",
 ]
 
+_INTERNAL_STEP_COUNTER = 0
+
+def reset_internal_step_counter():
+    """将内部步骤计数器重置为零。"""
+    global _INTERNAL_STEP_COUNTER
+    _INTERNAL_STEP_COUNTER = 0
+
+def increment_internal_step_counter():
+    """递增内部步骤计数器。"""
+    global _INTERNAL_STEP_COUNTER
+    _INTERNAL_STEP_COUNTER += 1
+
+def save_attn_tensor(q, k, layer_id):
+    """
+    计算 attention map 并将每个 head 的张量分别保存到本地指定文件夹。
+    文件夹结构为: {base_dir}/step_{step_id}/layer_{layer_id}/head_{head_id}.pt
+    """
+    # 在函数内指定保存的根目录
+    output_dir_base = "/mnt/public/chenpengyi/LaViDa-main/plot/attn_tensor_per_head_mme"
+    
+    # 根据全局步骤计数器和层ID构建完整的保存路径
+    # 确保 _INTERNAL_STEP_COUNTER 是可以被此函数访问的
+    current_step_dir = os.path.join(output_dir_base, f"step_{_INTERNAL_STEP_COUNTER}", f"layer_{layer_id}")
+
+    # 确保目标目录存在
+    os.makedirs(current_step_dir, exist_ok=True)
+
+    # --- 1. 计算 Attention Map ---
+    # 为保证数值稳定性，使用 float32 进行计算
+    q = q.to(torch.float32)
+    k = k.to(torch.float32)
+    
+    attn_scores = torch.matmul(q, k.transpose(-2, -1)) / (q.size(-1)**0.5)
+    attn_weights = torch.nn.functional.softmax(attn_scores, dim=-1)
+    
+    # 我们只保存 batch 中第一个样本的 attention map
+    # 形状: (num_heads, seq_len, seq_len)
+    attn_weights_sample = attn_weights[0].cpu().detach()
+
+    # --- 2. 【修改部分】拆分并分别保存每个 Head 的张量 ---
+    # 获取头的数量（通常是32）
+    num_heads = attn_weights_sample.shape[0]
+    
+    # 循环遍历每一个 head
+    for head_idx in range(num_heads):
+        # 提取当前 head 的 attention map，形状变为 (seq_len, seq_len)
+        head_tensor = attn_weights_sample[head_idx]
+        
+        # 构建该 head 的保存路径，文件名格式为 head_0.pt, head_1.pt, ...
+        save_path = os.path.join(current_step_dir, f"head_{head_idx}.pt")
+        
+        # 保存这个头独立的张量
+        torch.save(head_tensor, save_path)
 
 log = logging.getLogger(__name__)
-
 
 class ModuleType(StrEnum):
     in_module = "in"
@@ -646,6 +700,7 @@ class LLaDABlock(nn.Module):
         Computes scaled dot product attention on query, key and value tensors, using an optional
         attention mask if passed, and applying dropout if a probability greater than 0.0 is specified.
         """
+        print(k.shape)
         if self.flash_attn_func is not None and attn_mask is None:
             r = self.flash_attn_func(
                 q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), dropout_p=dropout_p, causal=False
@@ -661,6 +716,9 @@ class LLaDABlock(nn.Module):
                 k = k.repeat_interleave(num_q_heads // num_kv_heads, dim=1, output_size=num_q_heads)
                 v = v.repeat_interleave(num_q_heads // num_kv_heads, dim=1, output_size=num_q_heads)
 
+            # pyc
+            save_attn_tensor(q, k, self.layer_id)
+        
             # Modify: MDM set causal to False, and with no attn_mask.
             return F.scaled_dot_product_attention(
                 q,
@@ -1484,6 +1542,9 @@ class LLaDAModelLM(PreTrainedModel):
         prompt_len: Optional[torch.Tensor] = None,
         num_items_in_batch=None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
+        
+        increment_internal_step_counter()
+        
         if use_cache is None:
             use_cache = self.config.use_cache
 

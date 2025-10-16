@@ -116,7 +116,7 @@ import os
 DEBUG_PRINT_OUTPUT = os.environ.get('DEBUG_PRINT_OUTPUT',False)
 @ torch.no_grad()
 def generate(model, prompt=None, steps=None, max_new_tokens=128, block_length=128, temperature=0.,
-             cfg_scale=0., remasking='low_confidence', mask_id=126336,inputs_embeds=None, position_ids=None,attention_mask=None,
+              cfg_scale=0., remasking='low_confidence', mask_id=126336,inputs_embeds=None, position_ids=None,attention_mask=None,
               tokenizer=None,
                 verbose=False,
                 step_per_block=None,
@@ -125,6 +125,7 @@ def generate(model, prompt=None, steps=None, max_new_tokens=128, block_length=12
                 schedule_kwargs=None,
                 draft_tokens=None,
                 step_ratio=None,
+                SparseD_param=None,
              **kwargs):
     '''
     Args:
@@ -225,7 +226,12 @@ def generate(model, prompt=None, steps=None, max_new_tokens=128, block_length=12
                 else:
                     if inputs_embeds is not None:
                         inputs_embeds_curr[:,:inputs_embeds.shape[1]] = inputs_embeds
-                    logits = model(None,input_embeddings=inputs_embeds_curr).logits
+                    if SparseD_param is not None:
+                        SparseD_param["now_step"] = i + num_block * steps
+                        logits = model(None,input_embeddings=inputs_embeds_curr, SparseD_param=SparseD_param).logits
+                    else:
+                        logits = model(None,input_embeddings=inputs_embeds_curr).logits
+                        
             # logits = logits.cpu()
             logits_with_noise = add_gumbel_noise(logits, temperature=temperature)
             x0 = torch.argmax(logits_with_noise, dim=-1) # b, l
@@ -256,7 +262,6 @@ def generate(model, prompt=None, steps=None, max_new_tokens=128, block_length=12
 
             x0 = torch.where(mask_index, x0, x)
             confidence = torch.where(mask_index, x0_p, -np.inf)
-            print(confidence[mask_index])
 
             transfer_index = torch.zeros_like(x0, dtype=torch.bool, device=x0.device)
             for j in range(confidence.shape[0]):

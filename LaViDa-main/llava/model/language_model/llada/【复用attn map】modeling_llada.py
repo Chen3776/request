@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 import logging
 import math
 import sys
@@ -592,6 +593,10 @@ class LLaDABlock(nn.Module):
             except ModuleNotFoundError:
                 pass
 
+        self.cached_attn_map: Optional[torch.Tensor] = None
+        self.use_caching_attention = False
+        self.total_attention_time = 0.0
+
     def reset_parameters(self):
         if self.k_norm is not None:
             self.k_norm.reset_parameters()
@@ -633,6 +638,46 @@ class LLaDABlock(nn.Module):
             ensure_finite_(bias, check_neg_inf=True, check_pos_inf=False)
         return bias
 
+    # def _scaled_dot_product_attention(
+    #     self,
+    #     q: torch.Tensor,
+    #     k: torch.Tensor,
+    #     v: torch.Tensor,
+    #     attn_mask: Optional[torch.Tensor] = None,
+    #     dropout_p: float = 0.0,
+    #     is_causal: bool = False,
+    #     decode_step = None,
+    # ) -> torch.Tensor:
+    #     """
+    #     Computes scaled dot product attention on query, key and value tensors, using an optional
+    #     attention mask if passed, and applying dropout if a probability greater than 0.0 is specified.
+    #     """
+
+    #     if self.flash_attn_func is not None and attn_mask is None:
+    #         r = self.flash_attn_func(
+    #             q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), dropout_p=dropout_p, causal=False
+    #         )
+    #         return r.transpose(1, 2)
+    #     else:
+    #         # torch's sdpa doesn't support GQA, so we're doing this
+    #         assert k.size(1) == v.size(1)
+    #         num_kv_heads = k.size(1)
+    #         num_q_heads = q.size(1)
+    #         if num_q_heads != num_kv_heads:
+    #             assert num_q_heads % num_kv_heads == 0
+    #             k = k.repeat_interleave(num_q_heads // num_kv_heads, dim=1, output_size=num_q_heads)
+    #             v = v.repeat_interleave(num_q_heads // num_kv_heads, dim=1, output_size=num_q_heads)
+
+    #         # Modify: MDM set causal to False, and with no attn_mask.
+    #         return F.scaled_dot_product_attention(
+    #             q,
+    #             k,
+    #             v,
+    #             attn_mask=None,
+    #             dropout_p=dropout_p,
+    #             is_causal=False,
+    #         )
+
     def _scaled_dot_product_attention(
         self,
         q: torch.Tensor,
@@ -641,35 +686,61 @@ class LLaDABlock(nn.Module):
         attn_mask: Optional[torch.Tensor] = None,
         dropout_p: float = 0.0,
         is_causal: bool = False,
+        decode_step: Optional[int] = None,  # <--- 1. 增加 decode_step 参数
     ) -> torch.Tensor:
         """
         Computes scaled dot product attention on query, key and value tensors, using an optional
         attention mask if passed, and applying dropout if a probability greater than 0.0 is specified.
         """
         if self.flash_attn_func is not None and attn_mask is None:
-            r = self.flash_attn_func(
-                q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), dropout_p=dropout_p, causal=False
-            )
-            return r.transpose(1, 2)
-        else:
-            # torch's sdpa doesn't support GQA, so we're doing this
-            assert k.size(1) == v.size(1)
-            num_kv_heads = k.size(1)
-            num_q_heads = q.size(1)
-            if num_q_heads != num_kv_heads:
-                assert num_q_heads % num_kv_heads == 0
-                k = k.repeat_interleave(num_q_heads // num_kv_heads, dim=1, output_size=num_q_heads)
-                v = v.repeat_interleave(num_q_heads // num_kv_heads, dim=1, output_size=num_q_heads)
+            pass
+        
+        # torch's sdpa doesn't support GQA, so we're doing this
+        assert k.size(1) == v.size(1)
+        num_kv_heads = k.size(1)
+        num_q_heads = q.size(1)
+        if num_q_heads != num_kv_heads:
+            assert num_q_heads % num_kv_heads == 0
+            k = k.repeat_interleave(num_q_heads // num_kv_heads, dim=1, output_size=num_q_heads)
+            v = v.repeat_interleave(num_q_heads // num_kv_heads, dim=1, output_size=num_q_heads)
 
-            # Modify: MDM set causal to False, and with no attn_mask.
+        if self.use_caching_attention:
+        # 核心缓存逻辑
+        # decode_step=0是第一步，之后1,2,3步复用。所以当`decode_step % 4 != 0`时复用。
+            if decode_step is not None and decode_step % 32 != 0:
+                # ---> 复用路径 (Steps 2, 3, 4)
+                if self.cached_attn_map is None:
+                    raise RuntimeError(f"Attention map is not cached for layer {self.layer_id}, but trying to reuse it at decode_step {decode_step}.")
+                attn_weights = self.cached_attn_map
+            else:
+                # ---> 计算和缓存路径 (Step 1 或不启用缓存时)
+                # 1. 手动计算 QK^T / sqrt(d_k)
+                d_k = q.size(-1)
+                attn_scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(d_k)
+
+                # 2. 计算 softmax 得到 attention map
+                attn_weights = F.softmax(attn_scores, dim=-1)
+
+                # 3. 应用 dropout
+                if dropout_p > 0.0:
+                    attn_weights = F.dropout(attn_weights, p=dropout_p, training=self.training)
+
+                # 4. 缓存 attention map (如果启用了该功能)
+                if decode_step is not None:
+                    self.cached_attn_map = attn_weights
+            # 5. 用 attention map 乘以 V 得到最终结果
+            output = torch.matmul(attn_weights, v)
+            return output
+        else:
             return F.scaled_dot_product_attention(
-                q,
-                k,
-                v,
-                attn_mask=None,
-                dropout_p=dropout_p,
-                is_causal=False,
+            q,
+            k,
+            v,
+            attn_mask=None,
+            dropout_p=0.0 if not self.training else self.config.attention_dropout,
+            is_causal=False,
             )
+
     def _flex_attention(
         self,
         q: torch.Tensor,
@@ -706,7 +777,9 @@ class LLaDABlock(nn.Module):
         layer_past: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         use_cache: bool = False,
         block_mask: bool = None,
+        decode_step = None
     ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
+        
         B, T, C = q.size()  # batch size, sequence length, d_model
         dtype = k.dtype
 
@@ -746,6 +819,9 @@ class LLaDABlock(nn.Module):
                 attention_bias[:, :, key_len - query_len : key_len, :key_len], dtype
             )
 
+        torch.cuda.synchronize()
+        start_t = time.time()
+        
         # Get the attention scores.
         # shape: (B, nh, T, hs)
         if block_mask is not None:
@@ -766,11 +842,16 @@ class LLaDABlock(nn.Module):
                 attn_mask=None,
                 dropout_p=0.0 if not self.training else self.config.attention_dropout,
                 is_causal=False,
+                decode_step=decode_step,
             )
 
         # Re-assemble all head outputs side-by-side.
         att = att.transpose(1, 2).contiguous().view(B, T, C)
 
+        torch.cuda.synchronize()
+        end_t = time.time()
+        self.total_attention_time += (end_t - start_t)
+    
         # Apply output projection.
         return self.attn_out(att), present
 
@@ -942,6 +1023,7 @@ class LLaDALlamaBlock(LLaDABlock):
         layer_past: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         use_cache: bool = False,
         block_mask = None,
+        decode_step = None,
     ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         # Get query, key, value projections.
         # shape:
@@ -961,7 +1043,7 @@ class LLaDALlamaBlock(LLaDABlock):
                 self.attention, q, k, v, attention_bias, layer_past=layer_past, use_cache=use_cache,block_mask=block_mask
             )
         else:
-            att, cache = self.attention(q, k, v, attention_bias, layer_past=layer_past, use_cache=use_cache,block_mask=block_mask)
+            att, cache = self.attention(q, k, v, attention_bias, layer_past=layer_past, use_cache=use_cache,block_mask=block_mask,decode_step=decode_step)
 
         # Add attention scores.
         # shape: (B, T, C)
@@ -1223,6 +1305,7 @@ class LLaDAModel(nn.Module):
         last_logits_only: bool = False,
         output_hidden_states: Optional[bool] = None,
         prefix_length=None,
+        decode_step=None,
     ) -> LLaDAOutput:
         """
         :param input_ids: A tensor of shape `(batch_size, seq_len)`.
@@ -1386,7 +1469,7 @@ class LLaDAModel(nn.Module):
                     )
                 else:
                     # shape: (batch_size, seq_len, d_model)
-                    x, cache = block(x, attention_bias=attention_bias, layer_past=layer_past, use_cache=use_cache,block_mask=block_mask)
+                    x, cache = block(x, attention_bias=attention_bias, layer_past=layer_past, use_cache=use_cache,block_mask=block_mask, decode_step=decode_step)
                 if attn_key_values is not None:
                     assert cache is not None
                     attn_key_values.append(cache)
@@ -1483,6 +1566,7 @@ class LLaDAModelLM(PreTrainedModel):
         position_ids: bool = None,
         prompt_len: Optional[torch.Tensor] = None,
         num_items_in_batch=None,
+        decode_step=None
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         if use_cache is None:
             use_cache = self.config.use_cache
@@ -1502,6 +1586,7 @@ class LLaDAModelLM(PreTrainedModel):
             use_cache=use_cache,
             output_hidden_states=output_hidden_states,
             prefix_length=prompt_len,
+            decode_step=decode_step,
         )
 
         logits = outputs.logits

@@ -77,6 +77,70 @@ __all__ = [
     "LLaDAGenerateOutput",
 ]
 
+def plot_and_save_attn_map(q, k, layer_id, output_dir="/remote-home/pengyichen/Omni/DLLM/LaViDa-main/attn_maps"):
+    """
+    计算、绘制并保存注意力图。
+    此版本包含了自定义的颜色范围和主题。
+    所有必要的库都在此函数内部导入，以避免影响全局环境。
+    """
+    import os
+    import torch
+    import numpy as np
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+    from matplotlib.colors import LinearSegmentedColormap
+
+    # 确保输出目录存在
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+
+    # --- 1. 计算注意力图 ---
+    # 使用 bfloat16 计算可能会导致数值问题，转为 float32
+    q = q.to(torch.float32)
+    k = k.to(torch.float32)
+    
+    # 计算注意力得分 (Attention Score)
+    attn_scores = torch.matmul(q, k.transpose(-2, -1)) / (q.size(-1)**0.5)
+    
+    # 应用 softmax 得到注意力权重 (Attention Weights)
+    attn_weights = torch.nn.functional.softmax(attn_scores, dim=-1)
+    
+    # 我们只可视化 batch 中的第一个样本
+    # attn_weights 的形状: (batch_size, num_heads, seq_len, seq_len)
+    attn_weights_sample = attn_weights[0].cpu().detach().numpy()
+
+    # --- 2. 绘制并保存每个头的注意力图 ---
+    num_heads = attn_weights_sample.shape[0]
+    
+    # 定义颜色主题
+    cmap = LinearSegmentedColormap.from_list('white_to_dark_red', ['white', '#8B0000'])
+
+    for head_idx in range(num_heads):
+        # 获取当前头的注意力图数据
+        head_attn_map = attn_weights_sample[head_idx]
+        
+        # --- 使用百分位数来确定颜色范围 ---
+        vmin = np.percentile(head_attn_map, 1)
+        vmax = np.percentile(head_attn_map, 99)
+
+        plt.figure(figsize=(12, 10))
+        sns.heatmap(
+            head_attn_map,
+            cmap=cmap,
+            vmin=vmin,
+            vmax=vmax,
+            cbar=True # 显示颜色条
+        )
+        
+        ax = plt.gca()
+        # 隐藏坐标轴刻度标签，使图像更简洁
+        ax.tick_params(left=False, bottom=False, labelleft=False, labelbottom=False)
+        plt.title(f"Layer {layer_id} - Head {head_idx}", fontsize=16)
+        
+        # 定义保存路径
+        save_path = os.path.join(output_dir, f"layer_{layer_id}_head_{head_idx}.png")
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.close() # 关闭图像，防止在内存中累积
 
 log = logging.getLogger(__name__)
 
@@ -646,6 +710,7 @@ class LLaDABlock(nn.Module):
         Computes scaled dot product attention on query, key and value tensors, using an optional
         attention mask if passed, and applying dropout if a probability greater than 0.0 is specified.
         """
+        print(k.shape)
         if self.flash_attn_func is not None and attn_mask is None:
             r = self.flash_attn_func(
                 q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), dropout_p=dropout_p, causal=False
@@ -661,6 +726,9 @@ class LLaDABlock(nn.Module):
                 k = k.repeat_interleave(num_q_heads // num_kv_heads, dim=1, output_size=num_q_heads)
                 v = v.repeat_interleave(num_q_heads // num_kv_heads, dim=1, output_size=num_q_heads)
 
+            # pyc
+            plot_and_save_attn_map(q, k, self.layer_id)
+        
             # Modify: MDM set causal to False, and with no attn_mask.
             return F.scaled_dot_product_attention(
                 q,

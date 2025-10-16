@@ -54,12 +54,16 @@ import torch.nn.functional as F
 # except:
 #     flex_attention = None
 #     create_block_mask = None
-flex_attention = None
-create_block_mask = None
+# flex_attention = None
+# create_block_mask = None
 import  os
 if os.environ.get("USE_FLEX_ATTENTION", "0") == "1":
     from torch.nn.attention.flex_attention import flex_attention,create_block_mask
     flex_attention = torch.compile(flex_attention, dynamic=False, mode="max-autotune-no-cudagraphs")
+
+from torch.nn.attention.flex_attention import flex_attention,create_block_mask
+flex_attention = torch.compile(flex_attention, dynamic=False, mode="max-autotune-no-cudagraphs")
+
 __all__ = [
     "LayerNormBase",
     "LayerNorm",
@@ -77,9 +81,9 @@ __all__ = [
     "LLaDAGenerateOutput",
 ]
 
+from .SparseD_utils import create_block_mask_cached, customize_mask, create_attention_block_mask
 
 log = logging.getLogger(__name__)
-
 
 class ModuleType(StrEnum):
     in_module = "in"
@@ -706,7 +710,13 @@ class LLaDABlock(nn.Module):
         layer_past: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         use_cache: bool = False,
         block_mask: bool = None,
+        SparseD_param: Optional[Dict] = None,
     ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
+        
+        if SparseD_param is not None:
+            now_step, whole_steps, new_generation = SparseD_param['now_step'], SparseD_param['whole_steps'], SparseD_param['new_generation']
+            skip, select, block_size = SparseD_param['skip'], SparseD_param['select'], SparseD_param['block_size']
+
         B, T, C = q.size()  # batch size, sequence length, d_model
         dtype = k.dtype
 
@@ -748,17 +758,8 @@ class LLaDABlock(nn.Module):
 
         # Get the attention scores.
         # shape: (B, nh, T, hs)
-        if block_mask is not None:
-            att = self._flex_attention(
-                q,
-                k,
-                v,
-                #attn_mask=None,
-                dropout_p=0.0 if not self.training else self.config.attention_dropout,
-                # is_causal=False,
-                block_mask=block_mask
-            )
-        else:
+        # import pdb; pdb.set_trace()
+        if SparseD_param is None:
             att = self._scaled_dot_product_attention(
                 q,
                 k,
@@ -767,6 +768,49 @@ class LLaDABlock(nn.Module):
                 dropout_p=0.0 if not self.training else self.config.attention_dropout,
                 is_causal=False,
             )
+        else:
+            if now_step == 0:
+                self.fine_mask = None
+                self.last = None
+                self.block_mask = None
+            
+            end_time = int(whole_steps*skip)+1
+            if now_step <= end_time:
+                if now_step==end_time:
+                    query_states, key_states, value_states = q, k, v
+                    if self.fine_mask is None:
+                        bsz, num_heads, q_len, kv_len = query_states.size(0), query_states.size(1), query_states.size(2), key_states.size(2)
+                        self.fine_mask = torch.zeros((bsz, num_heads, (q_len+block_size-1)//block_size, (kv_len+block_size-1)//block_size), dtype=torch.bool, device=query_states.device)
+                        for idx in range((q_len+block_size-1)//block_size):
+                            if q_len - idx*block_size <= new_generation or idx==(q_len+block_size-1)//block_size-1:
+                                if self.last is None: self.last = idx
+                            query_states_reduce = query_states[:, :, idx*block_size:(idx+1)*block_size]
+                            attn_weights = torch.matmul(query_states_reduce, key_states.transpose(2, 3)) / math.sqrt(num_heads)
+                            attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+                            fine_mask = create_attention_block_mask(attn_weights, block_size=block_size, keep_ratio=select) 
+                            self.fine_mask[:, :, idx:idx+1, :] = fine_mask[:, : :1, :]
+                        self.fine_mask[:, :, :, self.last:] = False
+                    if self.block_mask is None:
+                        bsz, num_heads, q_len, kv_len = query_states.size(0), query_states.size(1), query_states.size(2), key_states.size(2)
+                        key_states_reduce = key_states[:, :, self.last*block_size:, :]
+                        for idx in range((q_len+block_size-1)//block_size):
+                            query_states_reduce = query_states[:, :, idx*block_size:(idx+1)*block_size]
+                            attn_weights = torch.matmul(query_states_reduce, key_states_reduce.transpose(2, 3)) / math.sqrt(num_heads)
+                            attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+                            fine_mask = create_attention_block_mask(attn_weights, block_size=block_size, keep_ratio=select) 
+                            self.fine_mask[:, :, idx:idx+1, self.last:] = torch.logical_or(self.fine_mask[:, :, idx:idx+1, self.last:], fine_mask[:, : :1, :])
+                        new_mask = customize_mask(self.fine_mask, block_size=block_size)
+                        self.block_mask = create_block_mask_cached(new_mask, bsz, num_heads, q_len, kv_len, device=query_states.device, _compile=True)  
+                att = self._scaled_dot_product_attention(
+                    q,
+                    k,
+                    v,
+                    attn_mask=None,
+                    dropout_p=0.0 if not self.training else self.config.attention_dropout,
+                    is_causal=False,
+                )
+            else:
+                att = self._flex_attention(q, k, v, block_mask=self.block_mask)
 
         # Re-assemble all head outputs side-by-side.
         att = att.transpose(1, 2).contiguous().view(B, T, C)
@@ -942,6 +986,7 @@ class LLaDALlamaBlock(LLaDABlock):
         layer_past: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         use_cache: bool = False,
         block_mask = None,
+        SparseD_param: Optional[Dict] = None,
     ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         # Get query, key, value projections.
         # shape:
@@ -961,7 +1006,7 @@ class LLaDALlamaBlock(LLaDABlock):
                 self.attention, q, k, v, attention_bias, layer_past=layer_past, use_cache=use_cache,block_mask=block_mask
             )
         else:
-            att, cache = self.attention(q, k, v, attention_bias, layer_past=layer_past, use_cache=use_cache,block_mask=block_mask)
+            att, cache = self.attention(q, k, v, attention_bias, layer_past=layer_past, use_cache=use_cache,block_mask=block_mask, SparseD_param=SparseD_param)
 
         # Add attention scores.
         # shape: (B, T, C)
@@ -1223,6 +1268,7 @@ class LLaDAModel(nn.Module):
         last_logits_only: bool = False,
         output_hidden_states: Optional[bool] = None,
         prefix_length=None,
+        SparseD_param: Optional[dict] = None,
     ) -> LLaDAOutput:
         """
         :param input_ids: A tensor of shape `(batch_size, seq_len)`.
@@ -1362,31 +1408,33 @@ class LLaDAModel(nn.Module):
                     all_hidden_states.append(x)
                 # breakpoint()
                 layer_past = None if past_key_values is None else past_key_values[block_idx]
-                if (
-                    (self.activation_checkpointing_strategy == ActivationCheckpointingStrategy.whole_layer)
-                    or (
-                        self.activation_checkpointing_strategy == ActivationCheckpointingStrategy.one_in_two
-                        and block_idx % 2 == 0
-                    )
-                    or (
-                        self.activation_checkpointing_strategy == ActivationCheckpointingStrategy.one_in_three
-                        and block_idx % 3 == 0
-                    )
-                    or (
-                        self.activation_checkpointing_strategy == ActivationCheckpointingStrategy.one_in_four
-                        and block_idx % 4 == 0
-                    )
-                ):
-                    # shape: (batch_size, seq_len, d_model)
-                    # x, cache = self._activation_checkpoint_fn(
-                    #     block, x, attention_bias=attention_bias, layer_past=layer_past, use_cache=use_cache
-                    # )
-                    x, cache = self._activation_checkpoint_fn(
-                        block, x, attention_bias, layer_past, use_cache,block_mask
-                    )
-                else:
-                    # shape: (batch_size, seq_len, d_model)
-                    x, cache = block(x, attention_bias=attention_bias, layer_past=layer_past, use_cache=use_cache,block_mask=block_mask)
+                # if (
+                #     (self.activation_checkpointing_strategy == ActivationCheckpointingStrategy.whole_layer)
+                #     or (
+                #         self.activation_checkpointing_strategy == ActivationCheckpointingStrategy.one_in_two
+                #         and block_idx % 2 == 0
+                #     )
+                #     or (
+                #         self.activation_checkpointing_strategy == ActivationCheckpointingStrategy.one_in_three
+                #         and block_idx % 3 == 0
+                #     )
+                #     or (
+                #         self.activation_checkpointing_strategy == ActivationCheckpointingStrategy.one_in_four
+                #         and block_idx % 4 == 0
+                #     )
+                # ):
+                #     # shape: (batch_size, seq_len, d_model)
+                #     # x, cache = self._activation_checkpoint_fn(
+                #     #     block, x, attention_bias=attention_bias, layer_past=layer_past, use_cache=use_cache
+                #     # )
+                #     import pdb; pdb.set_trace()
+                #     x, cache = self._activation_checkpoint_fn(
+                #         block, x, attention_bias, layer_past, use_cache,block_mask
+                #     )
+                # else:
+                #     # shape: (batch_size, seq_len, d_model)
+                #     import pdb; pdb.set_trace()
+                x, cache = block(x, attention_bias=attention_bias, layer_past=layer_past, use_cache=use_cache,block_mask=block_mask, SparseD_param=SparseD_param)
                 if attn_key_values is not None:
                     assert cache is not None
                     attn_key_values.append(cache)
@@ -1483,6 +1531,7 @@ class LLaDAModelLM(PreTrainedModel):
         position_ids: bool = None,
         prompt_len: Optional[torch.Tensor] = None,
         num_items_in_batch=None,
+        SparseD_param: Optional[dict] = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         if use_cache is None:
             use_cache = self.config.use_cache
@@ -1502,6 +1551,7 @@ class LLaDAModelLM(PreTrainedModel):
             use_cache=use_cache,
             output_hidden_states=output_hidden_states,
             prefix_length=prompt_len,
+            SparseD_param=SparseD_param,
         )
 
         logits = outputs.logits

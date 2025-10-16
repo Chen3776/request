@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 import logging
 import math
 import sys
@@ -31,6 +32,10 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.models.auto import AutoModel
 from transformers.cache_utils import Cache
 
+from torch.backends.cuda import sdp_kernel
+
+from torch.profiler import record_function
+
 from .configuration_llada import (
     LLaDAConfig,
     StrEnum,
@@ -41,6 +46,8 @@ from .configuration_llada import (
     ModelConfig,
     ActivationCheckpointingStrategy,
 )
+
+import pdb
 
 if sys.version_info.minor > 8:
     from collections.abc import MutableMapping
@@ -80,6 +87,71 @@ __all__ = [
 
 log = logging.getLogger(__name__)
 
+# change
+def plot_and_save_attn_map(q, k, layer_id, output_dir="/remote-home/pengyichen/Omni/DLLM/LaViDa-main/attn_maps"):
+    """
+    计算、绘制并保存注意力图。
+    此版本包含了自定义的颜色范围和主题。
+    所有必要的库都在此函数内部导入，以避免影响全局环境。
+    """
+    import os
+    import torch
+    import numpy as np
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+    from matplotlib.colors import LinearSegmentedColormap
+
+    # 确保输出目录存在
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+
+    # --- 1. 计算注意力图 ---
+    # 使用 bfloat16 计算可能会导致数值问题，转为 float32
+    q = q.to(torch.float32)
+    k = k.to(torch.float32)
+    
+    # 计算注意力得分 (Attention Score)
+    attn_scores = torch.matmul(q, k.transpose(-2, -1)) / (q.size(-1)**0.5)
+    
+    # 应用 softmax 得到注意力权重 (Attention Weights)
+    attn_weights = torch.nn.functional.softmax(attn_scores, dim=-1)
+    
+    # 我们只可视化 batch 中的第一个样本
+    # attn_weights 的形状: (batch_size, num_heads, seq_len, seq_len)
+    attn_weights_sample = attn_weights[0].cpu().detach().numpy()
+
+    # --- 2. 绘制并保存每个头的注意力图 ---
+    num_heads = attn_weights_sample.shape[0]
+    
+    # 定义颜色主题
+    cmap = LinearSegmentedColormap.from_list('white_to_dark_red', ['white', '#8B0000'])
+
+    for head_idx in range(num_heads):
+        # 获取当前头的注意力图数据
+        head_attn_map = attn_weights_sample[head_idx]
+        
+        # --- 使用百分位数来确定颜色范围 ---
+        vmin = np.percentile(head_attn_map, 1)
+        vmax = np.percentile(head_attn_map, 99)
+
+        plt.figure(figsize=(12, 10))
+        sns.heatmap(
+            head_attn_map,
+            cmap=cmap,
+            vmin=vmin,
+            vmax=vmax,
+            cbar=True # 显示颜色条
+        )
+        
+        ax = plt.gca()
+        # 隐藏坐标轴刻度标签，使图像更简洁
+        ax.tick_params(left=False, bottom=False, labelleft=False, labelbottom=False)
+        plt.title(f"Layer {layer_id} - Head {head_idx}", fontsize=16)
+        
+        # 定义保存路径
+        save_path = os.path.join(output_dir, f"layer_{layer_id}_head_{head_idx}.png")
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.close() # 关闭图像，防止在内存中累积
 
 class ModuleType(StrEnum):
     in_module = "in"
@@ -591,7 +663,20 @@ class LLaDABlock(nn.Module):
                 self.flash_attn_func = flash_attn_func
             except ModuleNotFoundError:
                 pass
+        self.cached_topk_indices = None
+        self.topk_update_interval = 8
+        self.prefix_lm_mode = None
+        
+        self.cached_attention_output: Optional[torch.Tensor] = None
+        self.attention_recompute_interval = 32
 
+    def reset_request_state(self):
+        self.prefix_lm_mode = None
+        self.cached_topk_indices = None
+    
+    def reset_attn_cache(self):
+        self.cached_attention_output = None
+    
     def reset_parameters(self):
         if self.k_norm is not None:
             self.k_norm.reset_parameters()
@@ -641,11 +726,13 @@ class LLaDABlock(nn.Module):
         attn_mask: Optional[torch.Tensor] = None,
         dropout_p: float = 0.0,
         is_causal: bool = False,
+        decode_step: Optional[int] = None,
     ) -> torch.Tensor:
         """
         Computes scaled dot product attention on query, key and value tensors, using an optional
         attention mask if passed, and applying dropout if a probability greater than 0.0 is specified.
         """
+
         if self.flash_attn_func is not None and attn_mask is None:
             r = self.flash_attn_func(
                 q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), dropout_p=dropout_p, causal=False
@@ -660,7 +747,10 @@ class LLaDABlock(nn.Module):
                 assert num_q_heads % num_kv_heads == 0
                 k = k.repeat_interleave(num_q_heads // num_kv_heads, dim=1, output_size=num_q_heads)
                 v = v.repeat_interleave(num_q_heads // num_kv_heads, dim=1, output_size=num_q_heads)
-
+            
+            # pyc
+            # plot_and_save_attn_map(q, k, self.layer_id)
+            
             # Modify: MDM set causal to False, and with no attn_mask.
             return F.scaled_dot_product_attention(
                 q,
@@ -670,6 +760,193 @@ class LLaDABlock(nn.Module):
                 dropout_p=dropout_p,
                 is_causal=False,
             )
+
+    def _request_attention(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        top_k: int,
+        decode_step: Optional[int],
+        dropout_p: float = 0.0,
+    ) -> torch.Tensor:
+        import math
+
+        if self.prefix_lm_mode is None:
+            if decode_step is None:
+                self.prefix_lm_mode = True
+                decode_step = 0
+                # print(f"prefix_lm is set at layer: {self.layer_id})")
+            else:
+                self.prefix_lm_mode = False
+                decode_step += 1
+
+        B, nh, T_q, hs = q.shape
+        T_k = k.shape[2]
+
+        effective_top_k = min(top_k, T_k)
+        if effective_top_k <= 0:
+            return torch.zeros_like(q)
+        
+        if self.cached_topk_indices is None or decode_step % self.topk_update_interval == 0:
+            with record_function("Sparse Indices"):
+                # 每隔 k步生成 sparse indices
+                full_scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(hs)
+                _, top_k_indices = torch.topk(full_scores, k=effective_top_k, dim=-1, sorted=False)
+                self.cached_topk_indices = top_k_indices
+        else:
+            top_k_indices = self.cached_topk_indices
+        
+        with record_function("Sparse Prepare"):
+            # 复用 indices
+            k_expanded = k.unsqueeze(2).expand(-1, -1, T_q, -1, -1)
+            v_expanded = v.unsqueeze(2).expand(-1, -1, T_q, -1, -1)
+            indices_expanded = top_k_indices.unsqueeze(-1).expand(-1, -1, -1, -1, hs)
+
+            k_sparse = torch.gather(k_expanded, 3, indices_expanded)
+            v_sparse = torch.gather(v_expanded, 3, indices_expanded)
+            
+        with record_function("Sparse Calculation"):
+            sparse_scores = torch.matmul(q.unsqueeze(3), k_sparse.transpose(-2, -1)).squeeze(3) / math.sqrt(hs)
+            sparse_attn_weights = torch.nn.functional.softmax(sparse_scores, dim=-1)
+        
+            if dropout_p > 0.0:
+                sparse_attn_weights = torch.nn.functional.dropout(sparse_attn_weights, p=dropout_p)
+            output = torch.matmul(sparse_attn_weights.unsqueeze(3), v_sparse).squeeze(3)
+        
+        return output
+
+    def _reusing_attention(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        decode_step: Optional[int],
+        dropout_p: float = 0.0,
+    ) -> torch.Tensor:
+        
+        should_recompute = (
+            decode_step is None or
+            self.cached_attention_output is None or
+            decode_step % self.attention_recompute_interval == 0
+        )
+        
+        if should_recompute:
+            output = self._scaled_dot_product_attention(
+                q, k, v, 
+                dropout_p=dropout_p,
+                is_causal=False,
+                decode_step=decode_step
+            )
+            self.cached_attention_output = output
+            return output
+        else:
+            return self.cached_attention_output
+    
+    def _eager_attention(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        dropout_p: float = 0.0,
+    ) -> torch.Tensor:
+
+        import math
+        import torch.nn.functional as F
+
+        num_kv_heads = k.size(1)
+        num_q_heads = q.size(1)
+        if num_q_heads != num_kv_heads:
+            if num_q_heads % num_kv_heads == 0:
+                k = k.repeat_interleave(num_q_heads // num_kv_heads, dim=1)
+                v = v.repeat_interleave(num_q_heads // num_kv_heads, dim=1)
+            else:
+                raise ValueError(f"查询头的数量 ({num_q_heads}) 必须是键/值头数量 ({num_kv_heads}) 的整数倍。")
+
+        head_size = q.size(-1)
+        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(head_size)
+        attn_weights = F.softmax(scores, dim=-1)
+
+        if dropout_p > 0.0:
+            attn_weights = F.dropout(attn_weights, p=dropout_p, training=self.training)
+
+        output = torch.matmul(attn_weights, v)
+
+        return output
+    
+    def _chunked_top_k_attention(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        chunk_size: int,
+        top_k_chunks: int,
+        dropout_p: float = 0.0,
+    ) -> torch.Tensor:
+        """
+        一个实验性的分块Top-K稀疏注意力实现（模拟版本）。
+        1.  计算完整的 (Q, K^T) 注意力分数矩阵。
+        2.  将Key序列划分为大小为 `chunk_size` 的区块。
+        3.  【最新逻辑】计算每个区块内所有分数绝对值的总和，作为该区块的重要性得分。
+        4.  根据每个区块的重要性得分，选出最高的 `top_k_chunks` 个区块。
+        5.  屏蔽掉所有其他区块，然后正常计算注意力。
+        """
+        import math
+        import torch.nn.functional as F
+
+        B, nh, T_q, hs = q.shape
+        T_k = k.shape[2]
+
+        # --- 1. 计算完整的注意力分数 ---
+        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(hs)
+
+        # --- 2. 确定区块属性并根据需要进行填充 ---
+        if T_k % chunk_size != 0:
+            pad_len = chunk_size - (T_k % chunk_size)
+            scores = F.pad(scores, (0, pad_len), value=0) # 用0填充，不影响求和
+        else:
+            pad_len = 0
+
+        padded_T_k = T_k + pad_len
+        num_chunks = padded_T_k // chunk_size
+
+        # --- 3. 【核心修改】计算每个区块的重要性得分 ---
+        # 将分数矩阵重塑为区块视图: (B, nh, T_q, num_chunks, chunk_size)
+        scores_reshaped = scores.view(B, nh, T_q, num_chunks, chunk_size)
+        
+        # 计算每个区块内所有分数绝对值的总和
+        # chunk_scores 的形状: (B, nh, T_q, num_chunks)
+        chunk_scores = torch.sum(torch.abs(scores_reshaped), dim=-1)
+
+        # --- 4. 根据新的区块得分，选出 Top-K 个区块 ---
+        # top_k_chunk_indices 的形状: (B, nh, T_q, top_k_chunks)
+        _, top_k_chunk_indices = torch.topk(chunk_scores, k=min(top_k_chunks, num_chunks), dim=-1)
+
+        # --- 5. 创建并应用Mask，屏蔽非Top-K区块 ---
+        # 为区块创建布尔掩码: (B, nh, T_q, num_chunks)
+        chunk_mask = torch.zeros_like(chunk_scores, dtype=torch.bool, device=q.device)
+        chunk_mask.scatter_(-1, top_k_chunk_indices, True)
+        
+        # 将区块掩码扩展至完整的注意力分数维度
+        expanded_mask = chunk_mask.unsqueeze(-1).expand(-1, -1, -1, -1, chunk_size)
+        full_mask = expanded_mask.reshape(B, nh, T_q, padded_T_k)
+        
+        if pad_len > 0:
+            full_mask = full_mask[..., :T_k]
+
+        # --- 6. 应用Mask并计算最终的注意力输出 ---
+        # 恢复原始的、未被填充的分数矩阵进行mask
+        original_scores = scores[..., :T_k]
+        masked_scores = original_scores.masked_fill(~full_mask, torch.finfo(scores.dtype).min)
+        
+        attn_weights = torch.nn.functional.softmax(masked_scores, dim=-1)
+        if dropout_p > 0.0:
+            attn_weights = torch.nn.functional.dropout(attn_weights, p=dropout_p)
+            
+        output = torch.matmul(attn_weights, v)
+        
+        return output
+
     def _flex_attention(
         self,
         q: torch.Tensor,
@@ -706,10 +983,12 @@ class LLaDABlock(nn.Module):
         layer_past: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         use_cache: bool = False,
         block_mask: bool = None,
+        past_length: int = 0,
+        decode_step = None,
     ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         B, T, C = q.size()  # batch size, sequence length, d_model
         dtype = k.dtype
-
+        
         # Optionally apply layer norm to keys and queries.
         if self.q_norm is not None and self.k_norm is not None:
             q = self.q_norm(q).to(dtype=dtype)
@@ -745,7 +1024,7 @@ class LLaDABlock(nn.Module):
             attention_bias = self._cast_attn_bias(
                 attention_bias[:, :, key_len - query_len : key_len, :key_len], dtype
             )
-
+            
         # Get the attention scores.
         # shape: (B, nh, T, hs)
         if block_mask is not None:
@@ -759,15 +1038,64 @@ class LLaDABlock(nn.Module):
                 block_mask=block_mask
             )
         else:
-            att = self._scaled_dot_product_attention(
-                q,
-                k,
-                v,
-                attn_mask=None,
-                dropout_p=0.0 if not self.training else self.config.attention_dropout,
-                is_causal=False,
-            )
+            # vanilla
+            # print(decode_step)
+            # with sdp_kernel(enable_flash=False, enable_math=True, enable_mem_efficient=False):
+            #     att = self._scaled_dot_product_attention(
+            #         q,
+            #         k,
+            #         v,
+            #         attn_mask=None,
+            #         dropout_p=0.0 if not self.training else self.config.attention_dropout,
+            #         is_causal=False,
+            #         decode_step=decode_step,
+            #     )
+                
+            # python eager
+            # with record_function("python_eager_attention"):
+            #     att = self._eager_attention(
+            #         q,
+            #         k,
+            #         v,
+            #         dropout_p=0.0 if not self.training else self.config.attention_dropout,
+            #     )
+            
+            # quest
+            # chunk_size = 4
+            # top_k_chunks = k.shape[2] // 2 // chunk_size
 
+            # att = self._chunked_top_k_attention(
+            #     q,
+            #     k,
+            #     v,
+            #     chunk_size=chunk_size,
+            #     top_k_chunks=top_k_chunks,
+            #     dropout_p=0.0 if not self.training else self.config.attention_dropout,
+            # )
+            
+            # request
+            current_seq_len = k.shape[2]
+            k_val = int(current_seq_len * 0.6)
+            with record_function("request_attention"):
+                att = self._request_attention(
+                    q,
+                    k,
+                    v,
+                    top_k=k_val,
+                    decode_step=decode_step,
+                    dropout_p=0.0 if not self.training else self.config.attention_dropout,
+                )
+
+            # reuse
+            # with record_function("reuse_attention"):
+            #     att = self._reusing_attention(
+            #         q,
+            #         k,
+            #         v,
+            #         decode_step=decode_step,
+            #         dropout_p=0.0 if not self.training else self.config.attention_dropout,
+            #     )
+        
         # Re-assemble all head outputs side-by-side.
         att = att.transpose(1, 2).contiguous().view(B, T, C)
 
@@ -839,6 +1167,7 @@ class LLaDASequentialBlock(LLaDABlock):
         layer_past: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         use_cache: bool = False,
         block_mask=None,
+        past_length: int = 0,
     ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         # Get query, key, value projections.
         # shape:
@@ -860,7 +1189,7 @@ class LLaDASequentialBlock(LLaDABlock):
                 self.attention, q, k, v, attention_bias, layer_past=layer_past, use_cache=use_cache,block_mask=block_mask
             )
         else:
-            att, cache = self.attention(q, k, v, attention_bias, layer_past=layer_past, use_cache=use_cache,block_mask=block_mask)
+            att, cache = self.attention(q, k, v, attention_bias, layer_past=layer_past, use_cache=use_cache,block_mask=block_mask,past_length=past_length)
 
         # Add attention scores.
         # shape: (B, T, C)
@@ -942,6 +1271,8 @@ class LLaDALlamaBlock(LLaDABlock):
         layer_past: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         use_cache: bool = False,
         block_mask = None,
+        past_length: int = 0,
+        decode_step = None,
     ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         # Get query, key, value projections.
         # shape:
@@ -958,10 +1289,10 @@ class LLaDALlamaBlock(LLaDABlock):
         # Get attention scores.
         if self._activation_checkpoint_fn is not None:
             att, cache = self._activation_checkpoint_fn(  # type: ignore
-                self.attention, q, k, v, attention_bias, layer_past=layer_past, use_cache=use_cache,block_mask=block_mask
+                self.attention, q, k, v, attention_bias, layer_past=layer_past, use_cache=use_cache,block_mask=block_mask,past_length=past_length
             )
         else:
-            att, cache = self.attention(q, k, v, attention_bias, layer_past=layer_past, use_cache=use_cache,block_mask=block_mask)
+            att, cache = self.attention(q, k, v, attention_bias, layer_past=layer_past, use_cache=use_cache,block_mask=block_mask,past_length=past_length,decode_step=decode_step)
 
         # Add attention scores.
         # shape: (B, T, C)
@@ -1219,11 +1550,13 @@ class LLaDAModel(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         attention_bias: Optional[torch.Tensor] = None,
         past_key_values: Optional[Sequence[Tuple[torch.Tensor, torch.Tensor]]] = None,
+        decode_step=None,
         use_cache: bool = False,
         last_logits_only: bool = False,
         output_hidden_states: Optional[bool] = None,
         prefix_length=None,
     ) -> LLaDAOutput:
+        
         """
         :param input_ids: A tensor of shape `(batch_size, seq_len)`.
         :param input_embeddings: A tensor of shape `(batch_size, seq_len, d_model)` with input
@@ -1250,6 +1583,9 @@ class LLaDAModel(nn.Module):
         :param last_logits_only: If `True`, only compute the logits for the last token of each sequence.
             This can speed up decoding when you only care about the next token.
         """
+        
+        # print(f">>> [LLaDAModel.forward] 函数被调用，decode_step 的值是: {decode_step}")
+        
         # Add Basic MDM Model config check
         assert not self.config.alibi, "Alibi length extrapolation is not supported for MDM."
         assert self.config.rope, "Rope must be used in Llama-Encoder for MDM."
@@ -1362,31 +1698,34 @@ class LLaDAModel(nn.Module):
                     all_hidden_states.append(x)
                 # breakpoint()
                 layer_past = None if past_key_values is None else past_key_values[block_idx]
-                if (
-                    (self.activation_checkpointing_strategy == ActivationCheckpointingStrategy.whole_layer)
-                    or (
-                        self.activation_checkpointing_strategy == ActivationCheckpointingStrategy.one_in_two
-                        and block_idx % 2 == 0
-                    )
-                    or (
-                        self.activation_checkpointing_strategy == ActivationCheckpointingStrategy.one_in_three
-                        and block_idx % 3 == 0
-                    )
-                    or (
-                        self.activation_checkpointing_strategy == ActivationCheckpointingStrategy.one_in_four
-                        and block_idx % 4 == 0
-                    )
-                ):
-                    # shape: (batch_size, seq_len, d_model)
-                    # x, cache = self._activation_checkpoint_fn(
-                    #     block, x, attention_bias=attention_bias, layer_past=layer_past, use_cache=use_cache
-                    # )
-                    x, cache = self._activation_checkpoint_fn(
-                        block, x, attention_bias, layer_past, use_cache,block_mask
-                    )
-                else:
-                    # shape: (batch_size, seq_len, d_model)
-                    x, cache = block(x, attention_bias=attention_bias, layer_past=layer_past, use_cache=use_cache,block_mask=block_mask)
+                
+                # if (
+                #     (self.activation_checkpointing_strategy == ActivationCheckpointingStrategy.whole_layer)
+                #     or (
+                #         self.activation_checkpointing_strategy == ActivationCheckpointingStrategy.one_in_two
+                #         and block_idx % 2 == 0
+                #     )
+                #     or (
+                #         self.activation_checkpointing_strategy == ActivationCheckpointingStrategy.one_in_three
+                #         and block_idx % 3 == 0
+                #     )
+                #     or (
+                #         self.activation_checkpointing_strategy == ActivationCheckpointingStrategy.one_in_four
+                #         and block_idx % 4 == 0
+                #     )
+                # ):
+                #     # shape: (batch_size, seq_len, d_model)
+                #     # x, cache = self._activation_checkpoint_fn(
+                #     #     block, x, attention_bias=attention_bias, layer_past=layer_past, use_cache=use_cache
+                #     # )
+                #     x, cache = self._activation_checkpoint_fn(
+                #         block, x, attention_bias, layer_past, use_cache, block_mask
+                #     )
+                # else:
+                #     # shape: (batch_size, seq_len, d_model)
+                #     x, cache = block(x, attention_bias=attention_bias, layer_past=layer_past, use_cache=use_cache,block_mask=block_mask,decode_step=decode_step)
+
+                x, cache = block(x, attention_bias=attention_bias, layer_past=layer_past, use_cache=use_cache,block_mask=block_mask,decode_step=decode_step)
                 if attn_key_values is not None:
                     assert cache is not None
                     attn_key_values.append(cache)
@@ -1466,7 +1805,9 @@ class LLaDAModelLM(PreTrainedModel):
             self.model = LLaDAModel(model_config, init_params=init_params)
         else:
             self.model = model
-        self.model.set_activation_checkpointing('whole_layer')
+        # self.model.set_activation_checkpointing('whole_layer')
+        self.model.set_activation_checkpointing('None')
+
     def forward(
         self,
         input_ids: torch.LongTensor = None,
@@ -1483,7 +1824,9 @@ class LLaDAModelLM(PreTrainedModel):
         position_ids: bool = None,
         prompt_len: Optional[torch.Tensor] = None,
         num_items_in_batch=None,
+        decode_step=None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
+
         if use_cache is None:
             use_cache = self.config.use_cache
 
@@ -1493,6 +1836,7 @@ class LLaDAModelLM(PreTrainedModel):
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
+
         outputs = self.model.forward(
             input_ids=input_ids,
             input_embeddings=inputs_embeds,
@@ -1502,6 +1846,7 @@ class LLaDAModelLM(PreTrainedModel):
             use_cache=use_cache,
             output_hidden_states=output_hidden_states,
             prefix_length=prompt_len,
+            decode_step=decode_step,
         )
 
         logits = outputs.logits

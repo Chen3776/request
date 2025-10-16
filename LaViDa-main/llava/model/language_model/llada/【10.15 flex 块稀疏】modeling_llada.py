@@ -54,12 +54,16 @@ import torch.nn.functional as F
 # except:
 #     flex_attention = None
 #     create_block_mask = None
-flex_attention = None
-create_block_mask = None
+# flex_attention = None
+# create_block_mask = None
 import  os
-if os.environ.get("USE_FLEX_ATTENTION", "0") == "1":
-    from torch.nn.attention.flex_attention import flex_attention,create_block_mask
-    flex_attention = torch.compile(flex_attention, dynamic=False, mode="max-autotune-no-cudagraphs")
+# if os.environ.get("USE_FLEX_ATTENTION", "0") == "1":
+#     from torch.nn.attention.flex_attention import flex_attention,create_block_mask
+#     flex_attention = torch.compile(flex_attention, dynamic=False, mode="max-autotune-no-cudagraphs")
+
+from torch.nn.attention.flex_attention import flex_attention,create_block_mask
+flex_attention = torch.compile(flex_attention, dynamic=False, mode="max-autotune-no-cudagraphs")
+
 __all__ = [
     "LayerNormBase",
     "LayerNorm",
@@ -591,6 +595,10 @@ class LLaDABlock(nn.Module):
                 self.flash_attn_func = flash_attn_func
             except ModuleNotFoundError:
                 pass
+            
+        self.block_sparse_mask_cache = None
+        self.K_BLOCK_SIZE = 32
+        self.TOP_K_BLOCKS = 4
 
     def reset_parameters(self):
         if self.k_norm is not None:
@@ -670,6 +678,7 @@ class LLaDABlock(nn.Module):
                 dropout_p=dropout_p,
                 is_causal=False,
             )
+            
     def _flex_attention(
         self,
         q: torch.Tensor,
@@ -706,6 +715,9 @@ class LLaDABlock(nn.Module):
         layer_past: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         use_cache: bool = False,
         block_mask: bool = None,
+        decode_step = None,
+        block_length=None,
+        gen_length=None,
     ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         B, T, C = q.size()  # batch size, sequence length, d_model
         dtype = k.dtype
@@ -745,20 +757,9 @@ class LLaDABlock(nn.Module):
             attention_bias = self._cast_attn_bias(
                 attention_bias[:, :, key_len - query_len : key_len, :key_len], dtype
             )
-
-        # Get the attention scores.
-        # shape: (B, nh, T, hs)
-        if block_mask is not None:
-            att = self._flex_attention(
-                q,
-                k,
-                v,
-                #attn_mask=None,
-                dropout_p=0.0 if not self.training else self.config.attention_dropout,
-                # is_causal=False,
-                block_mask=block_mask
-            )
-        else:
+            
+        # the first 4 step take sdpa, at the 4 step, get last_q attn map, and gen top k mask, and use flex attn in the following steps.
+        if decode_step <= 3 or self.block_sparse_mask_cache is None:
             att = self._scaled_dot_product_attention(
                 q,
                 k,
@@ -767,10 +768,46 @@ class LLaDABlock(nn.Module):
                 dropout_p=0.0 if not self.training else self.config.attention_dropout,
                 is_causal=False,
             )
+            
+            if decode_step == 3:
+                with torch.no_grad():
+                    # q shape: (B, nh, T, hs), kv shape: (B, n_kv_h, T, hs)
+                    last_q_len = gen_length + (T - gen_length) // 20
+                    last_q = q[:, :, -last_q_len:, :]
+                    scores = torch.matmul(last_q, k.transpose(-2, -1))
+                    # score shape (B, nh, small, hs)
+                    num_k_blocks = math.ceil(T / self.K_BLOCK_SIZE)
+                    pad_len = num_k_blocks * self.K_BLOCK_SIZE - T
+                    padded_scores = F.pad(scores, (0, pad_len))
+                    
+                    # B, T, C = q.size()  # batch size, sequence length, d_model
+                    block_scores = padded_scores.view(B, self.config.n_heads, last_q_len, num_k_blocks, self.K_BLOCK_SIZE)
+                    avg_block_scores = block_scores.mean(dim=(-1, -3))
+                    _, top_k_block_indices = torch.topk(avg_block_scores, self.TOP_K_BLOCKS, dim=-1)
+                    
+                    block_sparse_mask = torch.zeros((B, self.config.n_heads, num_k_blocks), dtype=torch.bool, device=q.device)
+                    block_sparse_mask.scatter_(2, top_k_block_indices, True)
+                    self.block_sparse_mask_cache = block_sparse_mask
+        else:
+            cached_mask = self.block_sparse_mask_cache
+            def block_sparse_mask_fn(b, h, q_idx, kv_idx):
+                block_idx = kv_idx // self.K_BLOCK_SIZE
+                max_idx = cached_mask.shape[-1]
+                in_bounds_mask = block_idx < max_idx
+                safe_block_idx = torch.clamp(block_idx, max=max_idx - 1)
+                lookup_value = cached_mask[b, h, safe_block_idx]
+                return in_bounds_mask & lookup_value.bool()
+            
+            current_block_mask = create_block_mask(block_sparse_mask_fn, B=B, H=self.config.n_heads, Q_LEN=query_len, KV_LEN=key_len)
+            # import pdb; pdb.set_trace()
+            att = flex_attention(
+                q, k, v,
+                block_mask=current_block_mask
+            )
 
         # Re-assemble all head outputs side-by-side.
         att = att.transpose(1, 2).contiguous().view(B, T, C)
-
+        
         # Apply output projection.
         return self.attn_out(att), present
 
@@ -942,6 +979,9 @@ class LLaDALlamaBlock(LLaDABlock):
         layer_past: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         use_cache: bool = False,
         block_mask = None,
+        decode_step = None,
+        block_length=None,
+        gen_length=None,
     ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         # Get query, key, value projections.
         # shape:
@@ -961,7 +1001,7 @@ class LLaDALlamaBlock(LLaDABlock):
                 self.attention, q, k, v, attention_bias, layer_past=layer_past, use_cache=use_cache,block_mask=block_mask
             )
         else:
-            att, cache = self.attention(q, k, v, attention_bias, layer_past=layer_past, use_cache=use_cache,block_mask=block_mask)
+            att, cache = self.attention(q, k, v, attention_bias, layer_past=layer_past, use_cache=use_cache,block_mask=block_mask, decode_step=decode_step,block_length=block_length,gen_length=gen_length)
 
         # Add attention scores.
         # shape: (B, T, C)
@@ -1223,6 +1263,9 @@ class LLaDAModel(nn.Module):
         last_logits_only: bool = False,
         output_hidden_states: Optional[bool] = None,
         prefix_length=None,
+        decode_step=None,
+        block_length=None,
+        gen_length=None,
     ) -> LLaDAOutput:
         """
         :param input_ids: A tensor of shape `(batch_size, seq_len)`.
@@ -1362,31 +1405,32 @@ class LLaDAModel(nn.Module):
                     all_hidden_states.append(x)
                 # breakpoint()
                 layer_past = None if past_key_values is None else past_key_values[block_idx]
-                if (
-                    (self.activation_checkpointing_strategy == ActivationCheckpointingStrategy.whole_layer)
-                    or (
-                        self.activation_checkpointing_strategy == ActivationCheckpointingStrategy.one_in_two
-                        and block_idx % 2 == 0
-                    )
-                    or (
-                        self.activation_checkpointing_strategy == ActivationCheckpointingStrategy.one_in_three
-                        and block_idx % 3 == 0
-                    )
-                    or (
-                        self.activation_checkpointing_strategy == ActivationCheckpointingStrategy.one_in_four
-                        and block_idx % 4 == 0
-                    )
-                ):
+                # if (
+                #     (self.activation_checkpointing_strategy == ActivationCheckpointingStrategy.whole_layer)
+                #     or (
+                #         self.activation_checkpointing_strategy == ActivationCheckpointingStrategy.one_in_two
+                #         and block_idx % 2 == 0
+                #     )
+                #     or (
+                #         self.activation_checkpointing_strategy == ActivationCheckpointingStrategy.one_in_three
+                #         and block_idx % 3 == 0
+                #     )
+                #     or (
+                #         self.activation_checkpointing_strategy == ActivationCheckpointingStrategy.one_in_four
+                #         and block_idx % 4 == 0
+                #     )
+                # ):
+                #     # shape: (batch_size, seq_len, d_model)
+                #     # x, cache = self._activation_checkpoint_fn(
+                #     #     block, x, attention_bias=attention_bias, layer_past=layer_past, use_cache=use_cache
+                #     # )
+                #     x, cache = self._activation_checkpoint_fn(
+                #         block, x, attention_bias, layer_past, use_cache,block_mask
+                #     )
+                # else:
                     # shape: (batch_size, seq_len, d_model)
-                    # x, cache = self._activation_checkpoint_fn(
-                    #     block, x, attention_bias=attention_bias, layer_past=layer_past, use_cache=use_cache
-                    # )
-                    x, cache = self._activation_checkpoint_fn(
-                        block, x, attention_bias, layer_past, use_cache,block_mask
-                    )
-                else:
-                    # shape: (batch_size, seq_len, d_model)
-                    x, cache = block(x, attention_bias=attention_bias, layer_past=layer_past, use_cache=use_cache,block_mask=block_mask)
+                    # x, cache = block(x, attention_bias=attention_bias, layer_past=layer_past, use_cache=use_cache,block_mask=block_mask)
+                x, cache = block(x, attention_bias=attention_bias, layer_past=layer_past, use_cache=use_cache,block_mask=block_mask,decode_step=decode_step,block_length=block_length,gen_length=gen_length)
                 if attn_key_values is not None:
                     assert cache is not None
                     attn_key_values.append(cache)
